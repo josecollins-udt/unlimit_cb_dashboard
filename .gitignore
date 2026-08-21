@@ -1,0 +1,6 @@
+
+*creds*.json
+*client_secret*.json
+*.p12
+*.pem
+.env
