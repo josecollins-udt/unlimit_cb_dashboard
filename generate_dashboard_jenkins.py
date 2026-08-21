@@ -1,22 +1,53 @@
-"""
-Chargeback Report Dashboard Generator
-======================================
-Queries fraud.fought_cbs_followup WHERE rechargeApi = 9 and generates
-a self-contained HTML dashboard inspired by the Kloutit design.
 
-Usage:
-    python generate_dashboard.py
-"""
-
+import sys
+import traceback
 import json
 import os
 import subprocess
+import pandas as pd
 from datetime import datetime
 from decimal import Decimal
 from collections import defaultdict
+from github import Github
 
-import pandas as pd
-from db_connection import get_db_connection
+
+
+
+# ---------------------------------------------------------------------------
+# Github data
+# ---------------------------------------------------------------------------
+GITHUB_TOKEN = os.getenv('dashboard_token')
+GITHUB_USER = os.getenv('unlimit_dashboard_git_user')
+GITHUB_REPO = os.getenv('unlimit_dashboard_git_repo')
+LOCAL_FILE_PATH = '/var/lib/jenkins/repos/fraud_ecommerce_pull/fraud_ecommerce/python/scripts/every_4_hour_unlimit_cb_dashboard/dashboard_output.html'
+GITHUB_FILE_PATH = 'dashboard_output.html'
+COMMIT_MESSAGE = f'Jenkins Update dashboard_output.html {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
+
+# ---------------------------------------------------------------------------
+# Database connection
+# ---------------------------------------------------------------------------
+import MySQLdb
+
+host = os.getenv('rep2host')
+user = os.getenv('frauduser')
+password = os.getenv('fraudpassword')    
+db= MySQLdb.connect(host=host,user=user,port = 3306,
+                password=password)
+cursor = db.cursor()
+
+db.set_character_set('utf8')
+cursor.execute('SET NAMES utf8')
+cursor.execute('SET CHARACTER SET utf8')
+cursor.execute('SET character_set_connection=utf8')
+
+sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------
+# Github authentication
+# ---------------------------------------------------------------------------
+github = Github(GITHUB_TOKEN)
+repo = github.get_user(GITHUB_USER).get_repo(GITHUB_REPO)
 
 
 # ---------------------------------------------------------------------------
@@ -28,56 +59,51 @@ STATUS_CONFIG = {
     "Documents submitted":  {"label": "Docs Enviados",   "color": "#2196F3", "bg": "#E3F2FD"},
     "submitted":            {"label": "Enviado a Unlimit",    "color": "#03A9F4", "bg": "#E1F5FE"},
     "Active":               {"label": "Activo",          "color": "#9C27B0", "bg": "#F3E5F5"},
+    "No Success":            {"label": "No Exitoso",          "color": "#B02727", "bg": "#F5E5E5"},
     "N/A (fought)":         {"label": "N/A (Peleado)",   "color": "#FFC107", "bg": "#FFF8E1"},
     "N/A (non-fought)":     {"label": "N/A (No Peleado)", "color": "#9E9E9E", "bg": "#F5F5F5"},
     None:                   {"label": "N/A",             "color": "#607D8B", "bg": "#ECEFF1"},
 }
 
-STATUS_ORDER = ["Won", "Accepted", "Documents submitted", "submitted", "Active", "N/A (fought)", "N/A (non-fought)", None]
+STATUS_ORDER = ["Won", "Accepted", "Documents submitted", "submitted", "Active", "No Success", "N/A (fought)", "N/A (non-fought)", None]
 
 
 def fetch_data():
     """Fetch all chargeback records using a single unified query."""
-    conn = get_db_connection()
-    if conn is None:
-        raise ConnectionError("Could not connect to the database.")
     try:
         query = """
         SELECT
-        cbs.user_id, cbs.amount, cbs.operator, cbs.credit_card, bl.type, bl.standard_bank_name AS bank, bl.country, cbs.payment_date, cbs.chargeback_received_date, IF(fcbs.sift_id IS NOT NULL, 1, 0) AS is_fought, fcbs.status, fcbs.created_at AS submission_date, fcbs.result_date
+          cbs.user_id, 
+          cbs.amount, 
+          cbs.operator, 
+          cbs.credit_card, 
+          bl.type, 
+          bl.standard_bank_name AS bank, 
+          bl.country, 
+          cbs.payment_date, 
+          cbs.chargeback_received_date, 
+          COALESCE(cbs.transaction_status,0) AS transaction_status,
+          IF(fcbs.sift_id IS NOT NULL, 1, 0) AS is_fought, 
+          fcbs.status, 
+          fcbs.created_at AS submission_date, 
+          fcbs.result_date
         FROM fraud.cb_payments AS cbs
         LEFT JOIN saldogra_gamma.binlist AS bl
         ON LEFT(cbs.credit_card,6) = bl.card_first_6
         LEFT JOIN fraud.fought_cbs_followup AS fcbs
         ON cbs.id = fcbs.payment_id
-        WHERE cbs.chargeback_received_date > CURDATE() - INTERVAL 6 MONTH
-        AND cbs.rechargeApi = 9
+        WHERE cbs.chargeback_received_date > DATE_FORMAT(CURDATE() - INTERVAL 6 MONTH, '%Y-%m-01')
+        AND cbs.rechargeApi IN (9,11)
         """
-        df = pd.read_sql(query, conn)
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', UserWarning)
+            df = pd.read_sql(query, db)
         return df
-    finally:
-        conn.close()
+    except Exception as e:
+        print(f"Error executing database query: {e}")
+        raise
 
-
-def process_data(df: pd.DataFrame) -> dict:
-    """
-    Aggregate the raw dataframe into summary structures
-    consumed by the HTML template.
-    """
-    # Normalise
-    df["amount"] = df["amount"].astype(float)
-    df["status"] = df["status"].where(df["status"].notna(), None)
-    
-    # Dashboard-specific status split
-    df["dashboard_status"] = df["status"]
-    df.loc[df["status"].isna() & (df["is_fought"] == 1), "dashboard_status"] = "N/A (fought)"
-    df.loc[df["status"].isna() & (df["is_fought"] == 0), "dashboard_status"] = "N/A (non-fought)"
-    
-    # We use submission_date for the month aggregations. 
-    # Use payment_date as fallback if there is no submission_date (unfought cb)
-    df["dashboard_date"] = pd.to_datetime(df["submission_date"])
-    df["dashboard_date"] = df["dashboard_date"].fillna(pd.to_datetime(df["payment_date"]))
-    df["month"] = df["dashboard_date"].dt.to_period("M")
 
 def _aggregate_dashboard_metrics(df: pd.DataFrame) -> dict:
     """Helper to aggregate all dashboard charts for a given dataframe slice."""
@@ -146,18 +172,38 @@ def _aggregate_dashboard_metrics(df: pd.DataFrame) -> dict:
                 by_status[s].append(float(df_temp.loc[mask, "amount"].sum()))
                 count_by_status[s].append(int(mask.sum()))
 
-        success = []
+        success_count = []
+        success_amount = []
+        fought_rate_count = []
+        fought_rate_amount = []
         for m in months_sorted:
             mask_month = df_temp["temp_month"] == m
-            lost_m = (mask_month & (df_temp["status"] == "Accepted")).sum()
-            won_m = (mask_month & (df_temp["status"] == "Won")).sum()
-            total_m = lost_m + won_m
-            success.append(round(won_m / total_m * 100, 1) if total_m else 0)
             
-        return month_labels, by_status, count_by_status, success
+            # Count logic
+            lost_m_c = (mask_month & (df_temp["status"] == "Accepted")).sum()
+            won_m_c = (mask_month & (df_temp["status"] == "Won")).sum()
+            total_resolved_m_c = lost_m_c + won_m_c
+            success_count.append(round(won_m_c / total_resolved_m_c * 100, 1) if total_resolved_m_c else 0)
+            
+            mask_month_valid = mask_month & (df_temp["dashboard_status"] != "No Success")
+            total_cb_m_c = mask_month_valid.sum()
+            fought_m_c = (mask_month_valid & (df_temp["is_fought"] == 1)).sum()
+            fought_rate_count.append(round(fought_m_c / total_cb_m_c * 100, 1) if total_cb_m_c else 0)
+            
+            # Amount logic
+            lost_m_a = df_temp.loc[(mask_month & (df_temp["status"] == "Accepted")), "amount"].sum()
+            won_m_a = df_temp.loc[(mask_month & (df_temp["status"] == "Won")), "amount"].sum()
+            total_resolved_m_a = lost_m_a + won_m_a
+            success_amount.append(round(won_m_a / total_resolved_m_a * 100, 1) if total_resolved_m_a else 0)
 
-    month_labels_payment, by_status_payment, count_by_status_payment, success_payment = _get_time_series("payment_date")
-    month_labels_cb, by_status_cb, count_by_status_cb, success_cb = _get_time_series("chargeback_received_date")
+            total_cb_m_a = df_temp.loc[mask_month_valid, "amount"].sum()
+            fought_m_a = df_temp.loc[(mask_month_valid & (df_temp["is_fought"] == 1)), "amount"].sum()
+            fought_rate_amount.append(round(fought_m_a / total_cb_m_a * 100, 1) if total_cb_m_a else 0)
+            
+        return month_labels, by_status, count_by_status, success_count, success_amount, fought_rate_count, fought_rate_amount
+
+    month_labels_payment, by_status_payment, count_by_status_payment, success_count_payment, success_amount_payment, fought_rate_count_payment, fought_rate_amount_payment = _get_time_series("payment_date")
+    month_labels_cb, by_status_cb, count_by_status_cb, success_count_cb, success_amount_cb, fought_rate_count_cb, fought_rate_amount_cb = _get_time_series("chargeback_received_date")
 
     # --- Top 10 Operators ---
     top_operators = (
@@ -168,14 +214,16 @@ def _aggregate_dashboard_metrics(df: pd.DataFrame) -> dict:
         .reset_index()
     )
     
+    def get_won_stats(group_by_col):
+        won_df = df[df["status"] == "Won"].groupby(group_by_col).agg(count=(group_by_col, "size"), total=("amount", "sum"))
+        lost_df = df[df["status"] == "Accepted"].groupby(group_by_col).agg(lost_count=(group_by_col, "size"), lost_total=("amount", "sum"))
+        stats = won_df.join(lost_df).fillna(0)
+        stats["win_rate_count"] = ((stats["count"] / (stats["count"] + stats["lost_count"])) * 100).round(1)
+        stats["win_rate_amount"] = ((stats["total"] / (stats["total"] + stats["lost_total"])) * 100).fillna(0).round(1)
+        return stats.sort_values("count", ascending=False).head(10).reset_index()
+
     # --- Top 10 Operators (Won) ---
-    top_operators_won = (
-        df[df["status"] == "Won"].groupby("operator")
-        .agg(count=("operator", "size"), total=("amount", "sum"))
-        .sort_values("count", ascending=False)
-        .head(10)
-        .reset_index()
-    )
+    top_operators_won = get_won_stats("operator")
 
     # --- Top 10 Banks (Total CBs) ---
     top_banks_total = (
@@ -187,13 +235,7 @@ def _aggregate_dashboard_metrics(df: pd.DataFrame) -> dict:
     )
     
     # --- Top 10 Banks (Won CBs) ---
-    top_banks_won = (
-        df[df["status"] == "Won"].groupby("bank")
-        .agg(count=("bank", "size"), total=("amount", "sum"))
-        .sort_values("count", ascending=False)
-        .head(10)
-        .reset_index()
-    )
+    top_banks_won = get_won_stats("bank")
 
     # --- Types Donut Data ---
     # e.g 'visa', 'mastercard', 'amex'
@@ -206,11 +248,16 @@ def _aggregate_dashboard_metrics(df: pd.DataFrame) -> dict:
         if 'amex' in t or 'american' in t: return 'AMEX'
         return 'Otro'
         
-    mapped_types = types_raw.apply(map_cc_type)
-    type_counts = mapped_types.value_counts()
+    df_types = df.copy()
+    df_types["mapped_type"] = types_raw.apply(map_cc_type)
+    type_stats = df_types.groupby("mapped_type").agg(
+        count=("mapped_type", "size"),
+        amount=("amount", "sum")
+    ).reset_index()
     
-    type_donut_labels = list(type_counts.index)
-    type_donut_values = [int(v) for v in type_counts.values]
+    type_donut_labels_raw = type_stats["mapped_type"].tolist()
+    type_donut_values_count = type_stats["count"].tolist()
+    type_donut_values_amount = type_stats["amount"].tolist()
     
     # Colors for the CC types
     cc_colors = {
@@ -219,7 +266,7 @@ def _aggregate_dashboard_metrics(df: pd.DataFrame) -> dict:
         'AMEX': '#002663',
         'Otro': '#9E9E9E'
     }
-    type_donut_colors = [cc_colors.get(l, '#9E9E9E') for l in type_donut_labels]
+    type_donut_colors = [cc_colors.get(l, '#9E9E9E') for l in type_donut_labels_raw]
 
     # --- Country Donut Data ---
     country_raw = df["country"].fillna("Desconocido").str.upper()
@@ -240,13 +287,15 @@ def _aggregate_dashboard_metrics(df: pd.DataFrame) -> dict:
     country_donut_colors = palette[:len(country_donut_labels)]
 
     # Status Donut Data
-    status_donut_labels = []
-    status_donut_values = []
+    status_donut_labels_raw = []
+    status_donut_values_count = []
+    status_donut_values_amount = []
     status_donut_colors = []
     for s in STATUS_ORDER[:-1]:
         cfg = STATUS_CONFIG[s]
-        status_donut_labels.append(cfg["label"])
-        status_donut_values.append(status_summary[s]["count"])
+        status_donut_labels_raw.append(cfg["label"])
+        status_donut_values_count.append(status_summary[s]["count"])
+        status_donut_values_amount.append(status_summary[s]["amount"])
         status_donut_colors.append(cfg["color"])
 
     return {
@@ -271,20 +320,28 @@ def _aggregate_dashboard_metrics(df: pd.DataFrame) -> dict:
         "month_labels_payment": month_labels_payment,
         "monthly_by_status_payment": by_status_payment,
         "monthly_count_by_status_payment": count_by_status_payment,
-        "monthly_success_payment": success_payment,
+        "monthly_success_count_payment": success_count_payment,
+        "monthly_success_amount_payment": success_amount_payment,
+        "monthly_fought_rate_count_payment": fought_rate_count_payment,
+        "monthly_fought_rate_amount_payment": fought_rate_amount_payment,
         "month_labels_cb": month_labels_cb,
         "monthly_by_status_cb": by_status_cb,
         "monthly_count_by_status_cb": count_by_status_cb,
-        "monthly_success_cb": success_cb,
+        "monthly_success_count_cb": success_count_cb,
+        "monthly_success_amount_cb": success_amount_cb,
+        "monthly_fought_rate_count_cb": fought_rate_count_cb,
+        "monthly_fought_rate_amount_cb": fought_rate_amount_cb,
         "top_operators": top_operators.to_dict("records"),
         "top_operators_won": top_operators_won.to_dict("records"),
         "top_banks_total": top_banks_total.to_dict("records"),
         "top_banks_won": top_banks_won.to_dict("records"),
-        "status_donut_labels": status_donut_labels,
-        "status_donut_values": status_donut_values,
+        "status_donut_labels_raw": status_donut_labels_raw,
+        "status_donut_values_count": status_donut_values_count,
+        "status_donut_values_amount": status_donut_values_amount,
         "status_donut_colors": status_donut_colors,
-        "type_donut_labels": type_donut_labels,
-        "type_donut_values": type_donut_values,
+        "type_donut_labels_raw": type_donut_labels_raw,
+        "type_donut_values_count": type_donut_values_count,
+        "type_donut_values_amount": type_donut_values_amount,
         "type_donut_colors": type_donut_colors,
         "country_donut_labels": country_donut_labels,
         "country_donut_values": country_donut_values,
@@ -304,11 +361,12 @@ def process_data(df: pd.DataFrame) -> dict:
     df["dashboard_status"] = df["status"]
     df.loc[df["status"].isna() & (df["is_fought"] == 1), "dashboard_status"] = "N/A (fought)"
     df.loc[df["status"].isna() & (df["is_fought"] == 0), "dashboard_status"] = "N/A (non-fought)"
+    df.loc[(df["transaction_status"] != 1) & (df["status"].isna()|(df["status"] != "Won")), "dashboard_status"] = "No Success"
     
     # We use submission_date for the month aggregations. 
     # Use payment_date as fallback if there is no submission_date (unfought cb)
     df["dashboard_date"] = pd.to_datetime(df["submission_date"])
-    df["dashboard_date"] = df["dashboard_date"].fillna(pd.to_datetime(df["payment_date"]))
+    df["dashboard_date"] = df["dashboard_date"].fillna(pd.to_datetime(df["chargeback_received_date"]))
     df["month"] = df["dashboard_date"].dt.to_period("M")
 
     # Metrics for all chargebacks
@@ -440,7 +498,7 @@ def generate_html(data: dict) -> str:
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Chargeback Dashboard — Unlimit (rechargeApi 9)</title>
+<title>Chargeback Dashboard — Unlimit</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Figtree:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
@@ -870,16 +928,16 @@ input:checked + .slider:before {{
 
   <div class="chart-grid-3">
     <div class="chart-card" style="display:flex;flex-direction:column;align-items:center;">
-      <h2 style="align-self:flex-start">Distribución del Estatus</h2>
-      <div class="chart-canvas-wrap med"><canvas id="chartStatus"></canvas></div>
-    </div>
-    <div class="chart-card" style="display:flex;flex-direction:column;align-items:center;">
       <h2 style="align-self:flex-start">Tasa de Éxito Mensual (%)</h2>
       <div class="chart-canvas-wrap med" style="width:100%"><canvas id="chartSuccess"></canvas></div>
     </div>
-    <div class="chart-card">
-      <h2>Desglose de Estatus</h2>
-      <div class="status-stack" id="status_cards_container" style="display:flex;flex-direction:column;gap:10px;"></div>
+    <div class="chart-card" style="display:flex;flex-direction:column;align-items:center;">
+      <h2 style="align-self:flex-start">Porcentaje de CBs Peleados (%)</h2>
+      <div class="chart-canvas-wrap med" style="width:100%"><canvas id="chartFoughtRate"></canvas></div>
+    </div>
+    <div class="chart-card" style="display:flex;flex-direction:column;align-items:center;">
+      <h2 style="align-self:flex-start">Distribución del Estatus</h2>
+      <div class="chart-canvas-wrap med"><canvas id="chartStatus"></canvas></div>
     </div>
   </div>
 
@@ -889,12 +947,12 @@ input:checked + .slider:before {{
       <div class="op-list" id="list_banks_total"></div>
     </div>
     <div class="chart-card">
-      <h2>Top 10 Bancos (Ganados)</h2>
+      <h2>Top 10 Bancos (Ganados [% Ganado])</h2>
       <div class="op-list" id="list_banks_won"></div>
     </div>
-    <div class="chart-card" style="display:flex;flex-direction:column;align-items:center;">
-      <h2 style="align-self:flex-start">Tipo de Tarjeta</h2>
-      <div class="chart-canvas-wrap med"><canvas id="chartType"></canvas></div>
+    <div class="chart-card">
+      <h2>Desglose de Estatus</h2>
+      <div class="status-stack" id="status_cards_container" style="display:flex;flex-direction:column;gap:10px;"></div>
     </div>
   </div>
 
@@ -904,12 +962,12 @@ input:checked + .slider:before {{
       <div class="op-list" id="list_operators"></div>
     </div>
     <div class="chart-card">
-      <h2>Top 10 Operadores (Ganados)</h2>
+      <h2>Top 10 Operadores (Ganados [% Ganado])</h2>
       <div class="op-list" id="list_operators_won"></div>
     </div>
     <div class="chart-card" style="display:flex;flex-direction:column;align-items:center;">
-      <h2 style="align-self:flex-start">Distribución por País</h2>
-      <div class="chart-canvas-wrap med"><canvas id="chartCountry"></canvas></div>
+      <h2 style="align-self:flex-start">Tipo de Tarjeta</h2>
+      <div class="chart-canvas-wrap med"><canvas id="chartType"></canvas></div>
     </div>
   </div>
 
@@ -1351,7 +1409,7 @@ let chartObjMain = null;
 let chartObjStatus = null;
 let chartObjSuccess = null;
 let chartObjType = null;
-let chartObjCountry = null;
+let chartObjFoughtRate = null;
 
 const fmtNum = new Intl.NumberFormat('en-US');
 const fmtCur = new Intl.NumberFormat('en-US', {{ style: 'currency', currency: 'USD' }});
@@ -1373,7 +1431,19 @@ function buildListHTML(listData, totalRecords, nameKey, showPct = false) {{
     let html = '';
     listData.forEach((item, i) => {{
         const pct = totalRecords ? (item.count / totalRecords * 100) : 0;
-        const pctStr = showPct ? ` <span style="font-size:0.8rem;color:#7a7a8c;font-weight:normal;margin-left:4px">(${{pct.toFixed(1)}}%)</span>` : '';
+        
+        let pctStr = '';
+        if (showPct) {{
+            pctStr = ` <span style="font-size:0.8rem;color:#7a7a8c;font-weight:normal;margin-left:4px">(${{pct.toFixed(1)}}%)</span>`;
+        }} else if (item.win_rate_count !== undefined) {{
+            pctStr = ` <span style="font-size:0.8rem;color:#7a7a8c;font-weight:normal;margin-left:4px">(${{item.win_rate_count}}%)</span>`;
+        }}
+
+        let amountPctStr = '';
+        if (item.win_rate_amount !== undefined) {{
+            amountPctStr = ` <span style="font-size:0.8rem;color:#7a7a8c;font-weight:normal;margin-left:4px">(${{item.win_rate_amount}}%)</span>`;
+        }}
+
         html += `
         <div class="op-row">
             <span class="op-rank">${{i+1}}</span>
@@ -1382,7 +1452,7 @@ function buildListHTML(listData, totalRecords, nameKey, showPct = false) {{
                 <div class="op-bar" style="width:${{pct.toFixed(1)}}%"></div>
             </div>
             <span class="op-count">${{fmtNum.format(item.count)}}${{pctStr}}</span>
-            <span class="op-amount">${{fmtCur.format(item.total)}}</span>
+            <span class="op-amount">${{fmtCur.format(item.total)}}${{amountPctStr}}</span>
         </div>`;
     }});
     return html;
@@ -1408,11 +1478,13 @@ function renderDashboardMode(isFoughtOnly) {{
     for (const status in STATUS_CONFIG) {{
         const cfg = STATUS_CONFIG[status];
         const info = st.status_summary[status];
+        const countPct = st.total_records > 0 ? ((info.count / st.total_records) * 100).toFixed(1) : 0;
+        const amountPct = st.total_amount > 0 ? ((info.amount / st.total_amount) * 100).toFixed(1) : 0;
         st_html += `
         <div class="status-card" style="border-left: 4px solid ${{cfg.color}}; background:${{cfg.color}}15">
             <div class="status-card-label">${{cfg.label}}</div>
-            <div class="status-card-count">${{fmtNum.format(info.count)}}</div>
-            <div class="status-card-amount">${{fmtCur.format(info.amount)}}</div>
+            <div class="status-card-count">${{fmtNum.format(info.count)}} <span style="font-size:0.8em; font-weight:normal;">(${{countPct}}%)</span></div>
+            <div class="status-card-amount">${{fmtCur.format(info.amount)}} <span style="font-size:0.8em; font-weight:normal;">(${{amountPct}}%)</span></div>
         </div>`;
     }}
     document.getElementById('status_cards_container').innerHTML = st_html;
@@ -1435,6 +1507,25 @@ function renderDashboardMode(isFoughtOnly) {{
     const mainMetric = document.getElementById('mainChartToggle').value;
     const arrayName = mainMetric === 'amount' ? `monthly_by_status${{suffix}}` : `monthly_count_by_status${{suffix}}`;
     
+    // Arrays for success/fought rate based on metric
+    const successArrayName = `monthly_success_${{mainMetric}}${{suffix}}`;
+    const foughtArrayName = `monthly_fought_rate_${{mainMetric}}_cb`;
+    
+    // Dynamic values for donut charts based on metric
+    const statusDonutValues = mainMetric === 'amount' ? st.status_donut_values_amount : st.status_donut_values_count;
+    const statusTotal = statusDonutValues.reduce((a, b) => a + b, 0);
+    const statusDonutLabels = st.status_donut_labels_raw.map((lbl, i) => {{
+        const pct = statusTotal ? ((statusDonutValues[i] / statusTotal) * 100).toFixed(1) : 0;
+        return `${{lbl}} (${{pct}}%)`;
+    }});
+
+    const typeDonutValues = mainMetric === 'amount' ? st.type_donut_values_amount : st.type_donut_values_count;
+    const typeTotal = typeDonutValues.reduce((a, b) => a + b, 0);
+    const typeDonutLabels = st.type_donut_labels_raw.map((lbl, i) => {{
+        const pct = typeTotal ? ((typeDonutValues[i] / typeTotal) * 100).toFixed(1) : 0;
+        return `${{lbl}} (${{pct}}%)`;
+    }});
+    
     if(chartObjMain) chartObjMain.destroy();
     chartObjMain = new Chart(document.getElementById('chartMain'), {{
         type: 'bar',
@@ -1456,8 +1547,8 @@ function renderDashboardMode(isFoughtOnly) {{
     chartObjStatus = new Chart(document.getElementById('chartStatus'), {{
         type: 'doughnut',
         data: {{
-            labels: st.status_donut_labels,
-            datasets: [{{ data: st.status_donut_values, backgroundColor: st.status_donut_colors }}]
+            labels: statusDonutLabels,
+            datasets: [{{ data: statusDonutValues, backgroundColor: st.status_donut_colors }}]
         }},
         options: {{
             responsive: true, maintainAspectRatio: false,
@@ -1469,8 +1560,8 @@ function renderDashboardMode(isFoughtOnly) {{
     chartObjType = new Chart(document.getElementById('chartType'), {{
         type: 'doughnut',
         data: {{
-            labels: st.type_donut_labels,
-            datasets: [{{ data: st.type_donut_values, backgroundColor: st.type_donut_colors }}]
+            labels: typeDonutLabels,
+            datasets: [{{ data: typeDonutValues, backgroundColor: st.type_donut_colors }}]
         }},
         options: {{
             responsive: true, maintainAspectRatio: false,
@@ -1480,17 +1571,25 @@ function renderDashboardMode(isFoughtOnly) {{
         }}
     }});
 
-    if(chartObjCountry) chartObjCountry.destroy();
-    chartObjCountry = new Chart(document.getElementById('chartCountry'), {{
-        type: 'doughnut',
+    if(chartObjFoughtRate) chartObjFoughtRate.destroy();
+    chartObjFoughtRate = new Chart(document.getElementById('chartFoughtRate'), {{
+        type: 'line',
         data: {{
-            labels: st.country_donut_labels,
-            datasets: [{{ data: st.country_donut_values, backgroundColor: st.country_donut_colors }}]
+            labels: st.month_labels_cb,
+            datasets: [{{
+                label: '% CBs Peleados',
+                data: st[foughtArrayName],
+                borderColor: '#9C27B0',
+                backgroundColor: 'rgba(156, 39, 176, 0.1)',
+                tension: 0.4,
+                fill: true
+            }}]
         }},
         options: {{
             responsive: true, maintainAspectRatio: false,
-            plugins: {{ 
-                legend: {{ position: 'bottom', labels: {{font: {{family: fontFam}}}}}} 
+            plugins: {{ legend: {{ display: false }} }},
+            scales: {{
+                y: {{ ticks: {{ callback: function(val) {{ return val + '%' }} }} }}
             }}
         }}
     }});
@@ -1502,7 +1601,7 @@ function renderDashboardMode(isFoughtOnly) {{
             labels: st[`month_labels${{suffix}}`],
             datasets: [{{
                 label: 'Tasa de Éxito',
-                data: st[`monthly_success${{suffix}}`],
+                data: st[successArrayName],
                 borderColor: '#2196F3',
                 backgroundColor: 'rgba(33, 150, 243, 0.1)',
                 tension: 0.4,
@@ -1512,7 +1611,9 @@ function renderDashboardMode(isFoughtOnly) {{
         options: {{
             responsive: true, maintainAspectRatio: false,
             plugins: {{ legend: {{ display: false }} }},
-            scales: {{ y: {{ max: 100, min: 0 }} }}
+            scales: {{
+                y: {{ ticks: {{ callback: function(val) {{ return val + '%' }} }} }}
+            }}
         }}
     }});
 }}
@@ -1546,42 +1647,19 @@ renderDashboardMode(false);
 
 
 # ---------------------------------------------------------------------------
-# GitHub Integration
+# Main
 # ---------------------------------------------------------------------------
 def push_to_github(file_path):
     print("\n[4/4] Committing to GitHub...")
     try:
-        # Check if git is available
-        subprocess.run(["git", "--version"], check=True, capture_output=True)
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
         
-        # Check if repo exists
-        git_check = subprocess.run(["git", "status"], capture_output=True, text=True)
-        if "not a git repository" in git_check.stderr.lower() or "not recognized" in git_check.stderr.lower():
-            print("      -> WARNING: This folder is not a valid git repository or git is not installed.")
-            return
-
-        # Add the file
-        subprocess.run(["git", "add", file_path], check=True, capture_output=True)
-        
-        # Commit
-        commit_msg = f"Auto-update: Dashboard generated {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-        subprocess.run(["git", "commit", "-m", commit_msg], check=True, capture_output=True)
-        
-        # Push
-        print("      -> Pushing to remote repository...")
-        subprocess.run(["git", "push"], check=True, capture_output=True)
+        contents = repo.get_contents(GITHUB_FILE_PATH)
+        repo.update_file(contents.path, COMMIT_MESSAGE, content, contents.sha, branch='main')
         print("      -> Successfully committed and pushed to GitHub!")
-        
-    except FileNotFoundError:
-        print("      -> ERROR: Git executable not found on the system pathway.")
-    except subprocess.CalledProcessError as e:
-        # Check if there was simply nothing to commit
-        if "nothing to commit" in getattr(e, 'stdout', b'').decode('utf-8').lower() or \
-           "nothing to commit" in getattr(e, 'stderr', b'').decode('utf-8').lower():
-            print("      -> No changes detected in the dashboard HTML. Skipping commit.")
-        else:
-            print(f"      -> ERROR during Git operations: {e}")
-
+    except Exception as e:
+        print(f"      -> ERROR during Git operations: {e}")
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
