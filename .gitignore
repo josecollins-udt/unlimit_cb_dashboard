@@ -10,3 +10,8 @@
 *.p12
 *.pem
 .env
+
+*.csv
+*.zip
+*.parquet
+*.xlsx
